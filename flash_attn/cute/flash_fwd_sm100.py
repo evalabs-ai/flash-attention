@@ -34,6 +34,7 @@ from quack import copy_utils, layout_utils
 
 from flash_attn.cute.paged_kv import PagedKVManager
 from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
+from flash_attn.cute import utils
 import flash_attn.cute.pipeline as pipeline_custom
 from flash_attn.cute.mask import AttentionMask
 from flash_attn.cute.softmax import SoftmaxSm100, apply_score_mod_inner
@@ -46,7 +47,7 @@ from flash_attn.cute.block_sparse_utils import (
     softmax_block_sparse_sm100,
     handle_block_sparse_empty_tile_correction_sm100,
 )
-from flash_attn.cute.pack_gqa import PackGQA
+from flash_attn.cute.pack_gqa import PackGQA, pack_gqa_layout
 from flash_attn.cute import mma_sm100_desc as sm100_desc
 from flash_attn.cute import blackwell_helpers as sm100_utils
 from flash_attn.cute.named_barrier import NamedBarrierFwdSm100
@@ -273,7 +274,7 @@ class FlashAttentionForwardSm100:
             self.head_dim_padded == 192 and self.head_dim_v_padded == 128 and self.kv_stage == 3
         )
         self.uneven_kv_smem_offset = (
-            self.m_block_size * (self.head_dim_padded - self.head_dim_v_padded) // 2
+            self.n_block_size * (self.head_dim_padded - self.head_dim_v_padded) // 2
             if self.uneven_kv_smem
             else 0
         )
@@ -446,50 +447,11 @@ class FlashAttentionForwardSm100:
             )
 
         if const_expr(self.pack_gqa):
-            shape_Q_packed = (
-                (self.qhead_per_kvhead, mQ.shape[0]),
-                mQ.shape[1],
-                mK.shape[2],
-                *mQ.shape[3:],
-            )
-            stride_Q_packed = (
-                (mQ.stride[2], mQ.stride[0]),
-                mQ.stride[1],
-                mQ.stride[2] * self.qhead_per_kvhead,
-                *mQ.stride[3:],
-            )
-            mQ = cute.make_tensor(
-                mQ.iterator, cute.make_layout(shape_Q_packed, stride=stride_Q_packed)
-            )
-            shape_O_packed = (
-                (self.qhead_per_kvhead, mO.shape[0]),
-                mO.shape[1],
-                mK.shape[2],
-                *mO.shape[3:],
-            )
-            stride_O_packed = (
-                (mO.stride[2], mO.stride[0]),
-                mO.stride[1],
-                mO.stride[2] * self.qhead_per_kvhead,
-                *mO.stride[3:],
-            )
-            mO = cute.make_tensor(
-                mO.iterator, cute.make_layout(shape_O_packed, stride=stride_O_packed)
-            )
+            nheads_kv = mK.shape[2]
+            mQ = pack_gqa_layout(mQ, self.qhead_per_kvhead, nheads_kv, head_idx=2)
+            mO = pack_gqa_layout(mO, self.qhead_per_kvhead, nheads_kv, head_idx=2)
             if const_expr(mLSE is not None):
-                shape_LSE_packed = (
-                    (self.qhead_per_kvhead, mLSE.shape[0]),
-                    mK.shape[2],
-                    *mLSE.shape[2:],
-                )
-                stride_LSE_packed = (
-                    (mLSE.stride[1], mLSE.stride[0]),
-                    mLSE.stride[1] * self.qhead_per_kvhead,
-                    *mLSE.stride[2:],
-                )
-                mLSE = cute.make_tensor(
-                    mLSE.iterator, cute.make_layout(shape_LSE_packed, stride=stride_LSE_packed)
-                )
+                mLSE = pack_gqa_layout(mLSE, self.qhead_per_kvhead, nheads_kv, head_idx=1)
 
         self.tma_copy_bytes = {
             name: cute.size_in_bytes(mX.element_type, cute.select(layout, mode=[0, 1, 2]))
@@ -641,35 +603,10 @@ class FlashAttentionForwardSm100:
 
         self.shared_storage = SharedStorage
 
-        LOG2_E = math.log2(math.e)
-        if const_expr(self.score_mod is None):
-            softmax_scale_log2 = softmax_scale * LOG2_E
-            softmax_scale = None
-        else:
-            # NB: If a users passes in a score mod, we want to apply the score-mod in the sm_scaled qk
-            # But in the original base 10. We hijack softmax_scale_log2 to just be the change of base
-            # and correctly apply the softmax_scale prior to score_mod in the softmax step
-            softmax_scale_log2 = LOG2_E
-            softmax_scale = softmax_scale
-
-        if const_expr(window_size_left is not None):
-            window_size_left = Int32(window_size_left)
-        if const_expr(window_size_right is not None):
-            window_size_right = Int32(window_size_right)
-
-        fastdiv_mods = None
-        if cutlass.const_expr(aux_tensors is not None):
-            seqlen_q = cute.size(mQ.shape[0]) // (
-                self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1
-            )
-            seqlen_k = (
-                cute.size(mK.shape[0])
-                if const_expr(mPageTable is None)
-                else mK.shape[0] * mPageTable.shape[1]
-            )
-            seqlen_q_divmod = FastDivmodDivisor(seqlen_q)
-            seqlen_k_divmod = FastDivmodDivisor(seqlen_k)
-            fastdiv_mods = (seqlen_q_divmod, seqlen_k_divmod)
+        softmax_scale_log2, softmax_scale = utils.compute_softmax_scale_log2(softmax_scale, self.score_mod)
+        window_size_left = Int32(window_size_left) if window_size_left is not None else None
+        window_size_right = Int32(window_size_right) if window_size_right is not None else None
+        fastdiv_mods = utils.compute_fastdiv_mods(mQ, mK, self.qhead_per_kvhead, self.pack_gqa, aux_tensors, mPageTable)
 
         head_divmod = None
         if cutlass.const_expr(self.pack_gqa):
