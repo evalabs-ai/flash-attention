@@ -170,6 +170,51 @@ BACKENDS = [
 ]
 
 
+def get_peak_flops(device_index: int = 0, dtype: torch.dtype = torch.bfloat16) -> float | None:
+    """Return peak BF16 dense TFLOPS for the given device. Returns None if unknown.
+
+    Scaling by dtype:
+      FP16 / BF16 : 1x  (identical hardware throughput)
+      FP8         : 2x
+    """
+    # BF16 dense peak FLOPS from official NVIDIA spec sheets.
+    # Checked against: num_SMs * tensor_core_clock * ops_per_SM_per_cycle.
+    # The tensor core clock is NOT queryable (it differs from the max boost SM
+    # clock reported by nvidia-smi), so we hardcode the spec-sheet values.
+    _PEAK_BF16_FLOPS = {
+        # Ampere
+        "A100":  312e12,
+        "A6000": 309.7e12,
+        # Ada Lovelace
+        "L40S":  362e12,
+        # Hopper
+        "H100 SXM": 989e12,
+        "H100 NVL": 835e12,
+        "H100 PCIe": 756e12,
+        "H200":  989e12,
+        "H20":   148e12,
+        # Blackwell
+        "GB200": 2.5e15,
+        "GB300": 2.5e15,
+        "B300":  2.25e15,
+        "B200":  2.25e15,
+    }
+
+    device_name = torch.cuda.get_device_name(device_index)
+    # Match longest key first so "H100 SXM" matches before "H100"
+    peak = None
+    for key in sorted(_PEAK_BF16_FLOPS, key=len, reverse=True):
+        if key.lower() in device_name.lower():
+            peak = _PEAK_BF16_FLOPS[key]
+            break
+    if peak is None:
+        return None
+
+    if dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+        peak *= 2
+    return peak
+
+
 def parse_int_k(s):
     """Parse an integer with optional k/K suffix, e.g. '8k' -> 8192."""
     s = s.strip().lower()
@@ -271,6 +316,7 @@ def main():
     dtype = torch.bfloat16
     dtype_gen = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
     device = 'cuda'
+    peak_flops = get_peak_flops(0, dtype=dtype)
     page_size = None
     softcap = 0.0
     deterministic = args.deterministic
@@ -357,7 +403,7 @@ def main():
     if not shown_backends:
         return
 
-    col_w = 16
+    col_w = 20 if peak_flops is not None else 16
 
     for direction, times, flops_mult in [("FWD", time_f, 1.0), ("BWD", time_b, 2.5)]:
         if not times:
@@ -366,11 +412,12 @@ def main():
         if not configs:
             continue
 
+        col_label = "ms / TFLOPS / MFU%" if peak_flops is not None else "ms / TFLOPS"
         header = f"{'hdim':>9} {'causal':>6} {'batch':>5} {'seqlen':>6}"
         for b in shown_backends:
             header += f" {b:>{col_w}}"
         print(f"\n{'=' * len(header)}")
-        print(f"  {direction} (ms / TFLOPS)")
+        print(f"  {direction} ({col_label})")
         print(f"{'=' * len(header)}")
         print(header)
         print("-" * len(header))
@@ -385,7 +432,11 @@ def main():
                 if t is not None:
                     tflops = flops_mult * nFLOPS / t * 1e-12
                     ms = t * 1e3
-                    cell = f"{ms:.2f}/{tflops:.0f}"
+                    if peak_flops is not None:
+                        mfu = flops_mult * nFLOPS / t / peak_flops * 100
+                        cell = f"{ms:.2f}/{tflops:.0f}/{mfu:.1f}%"
+                    else:
+                        cell = f"{ms:.2f}/{tflops:.0f}"
                     row += f" {cell:>{col_w}}"
                 else:
                     row += f" {'—':>{col_w}}"

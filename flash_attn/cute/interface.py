@@ -482,10 +482,6 @@ def _flash_attn_fwd(
     if pack_gqa and num_splits != 1 and cu_seqlens_q is None:
         pack_gqa = False
 
-    if arch // 10 in [10, 11]:
-        if pack_gqa and (128 % qhead_per_kvhead != 0):
-            pack_gqa = False
-
     if max_seqlen_q is None:
         max_seqlen_q = seqlen_q if cu_seqlens_q is None else total_q
     if max_seqlen_k is None:
@@ -532,6 +528,7 @@ def _flash_attn_fwd(
         and int(math.ceil(head_dim / 16) * 16) == 128
         and int(math.ceil(head_dim_v / 16) * 16) == 128
         and seqlen_q_packgqa > 2 * tile_m
+        and (tile_m % qhead_per_kvhead == 0 or not pack_gqa)
     )
 
     # hash score and mask mods for compile cache
@@ -620,7 +617,7 @@ def _flash_attn_fwd(
         is_split_kv,
         pack_gqa,
         arch,
-        page_size not in [None, 128],  # paged KV non-TMA
+        page_size not in [None, tile_n],  # paged KV non-TMA
         use_2cta_instrs,
         q_subtile_factor,
         mma_pv_is_rs,
@@ -685,7 +682,6 @@ def _flash_attn_fwd(
                 has_aux_tensors=aux_tensors is not None,
             )
         elif arch // 10 == 9:
-            assert page_table is None, "paged KV not supported on SM 9.0"
             assert not is_split_kv, "SplitKV not supported on SM 9.0"
             fa_fwd = FlashAttentionForwardSm90(
                 dtype,
@@ -707,6 +703,7 @@ def _flash_attn_fwd(
                 score_mod=score_mod,
                 has_aux_tensors=aux_tensors is not None,
                 q_subtile_factor=q_subtile_factor,
+                paged_kv_non_tma=page_size not in [None, tile_n],
             )
         elif arch // 10 in [10, 11]:
             fa_fwd = FlashAttentionForwardSm100(
@@ -728,7 +725,7 @@ def _flash_attn_fwd(
                 score_mod=score_mod,
                 mask_mod=mask_mod,
                 has_aux_tensors=aux_tensors is not None,
-                paged_kv_non_tma=page_size not in [None, 128],
+                paged_kv_non_tma=page_size not in [None, tile_n],
                 is_varlen_q=cu_seqlens_q is not None or seqused_q is not None,
                 q_subtile_factor=q_subtile_factor,
                 use_2cta_instrs=use_2cta_instrs,
@@ -1062,8 +1059,7 @@ def _flash_attn_bwd(
         AtomLayoutMdQ = 1
         AtomLayoutNdKV = 1
         disable_2cta = (
-            local
-            or score_mod is not None
+            score_mod is not None
             or score_mod_bwd is not None
             or mask_mod is not None
         )
